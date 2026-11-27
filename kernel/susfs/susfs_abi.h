@@ -60,7 +60,7 @@
 #define SUSFS_MAX_VARIANT_BUFSIZE               16
 
 #define SUSFS_VERSION_STR "v2.3.0"
-#define SUSFS_VARIANT_STR "GKI"
+#define SUSFS_VARIANT_STR "GKI-LKM"
 
 /* uid_scheme values of struct st_susfs_open_redirect (upstream enum UID_SCHEME, declared in
  * susfs.h next to the structs) */
@@ -173,6 +173,24 @@ struct st_susfs_variant {
 struct st_susfs_enabled_features {
 	char enabled_features[SUSFS_ENABLED_FEATURES_SIZE];
 	int err;
+};
+
+/* Feature registry for the reboot(2) supercall (ABI-visible numbering).  A
+ * layer arms its feature only after its init returned 0, so a non-fatal layer
+ * that failed is neither advertised by SHOW_ENABLED_FEATURES nor allowed to
+ * have its commands hijacked. */
+enum susfs_feature {
+	SUSFS_FEAT_SUS_PATH = 0,
+	SUSFS_FEAT_SUS_MOUNT,
+	SUSFS_FEAT_SUS_KSTAT,
+	SUSFS_FEAT_SPOOF_UNAME,
+	SUSFS_FEAT_ENABLE_LOG,
+	SUSFS_FEAT_HIDE_SYMS,
+	SUSFS_FEAT_SPOOF_CMDLINE,
+	SUSFS_FEAT_OPEN_REDIRECT,
+	SUSFS_FEAT_SUS_MAP,
+	SUSFS_FEAT_AVC_SPOOF,	/* commands only: no upstream CONFIG_* line for it */
+	SUSFS_FEAT_COUNT,
 };
 
 #endif

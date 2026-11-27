@@ -18,7 +18,9 @@
 #include <linux/types.h>
 
 #include "ksu_allow_gate.h"
+#include "ksu_allow_gate_data.h"
 #include "symbol_resolver.h"
+#include "susfs_control.h"
 #include "susfs_log.h"
 
 static const char *const ksu_allow_symbols[] = {
@@ -30,14 +32,6 @@ static const char *const ksu_allow_symbols[] = {
  * while susfs_ksu_allow_kind == 1, which is what lets the inline above test the kind instead of the
  * pointer on every call. */
 static bool (*ksu_allow_fn)(uid_t uid);
-
-/* 0 = no source resolved (strict fallback), 1 = KernelSU's predicate.  See the header. */
-int susfs_ksu_allow_kind;
-
-/* Whether the control nodes actually carry the ksu_file label, i.e. whether the KernelSU set may
- * be let through the gate at all.  Written once by susfs_relabel_control_nodes(), read by every
- * caller; see ksu_allow_gate.h for why an unrelabelled node has to stay root-only. */
-bool susfs_control_relabelled;
 
 /* noinline __nocfi: an indirect call through a resolved address.  CFI checks indirect call sites,
  * and LTO would otherwise inline a small static helper back into a caller that is not marked.
@@ -75,9 +69,19 @@ int susfs_ksu_allow_gate_init(void)
 	if (!addr) {
 		WRITE_ONCE(susfs_ksu_allow_kind, 0);
 		/* pr_warn, not SUSFS_LOGI: "the allowlist predicate is not in effect on this device"
-		 * is something an operator has to be able to see from the load alone. */
-		pr_warn("susfs_guard_lkm: neither %s nor %s is in kallsyms - the privileged-view predicate falls back to uid == 0, so a su-granted app and the manager app are NOT covered here.\n",
-			ksu_allow_symbols[0], ksu_allow_symbols[1]);
+		 * is something an operator has to be able to see from the load alone - but only where
+		 * the predicate can be asked at all.  susfs_control_visible() is its one caller, and
+		 * that one answers uid == 0 until susfs_control_relabelled is set, which
+		 * susfs_relabel_control_nodes() cannot do from 6.4 up: on every GKI from 6.6 the
+		 * control surface is root-only whatever this resolves, so a missing symbol changes
+		 * nothing and warning about it names a problem that is not one.  The version alone
+		 * is not enough: below 6.4, expose_proc=0 reaches the same early return and leaves
+		 * the same root-only gate. */
+		if (SUSFS_CONTROL_GATE_CAN_WIDEN && READ_ONCE(susfs_expose_proc))
+			pr_warn("susfs_guard_lkm: neither %s nor %s is in kallsyms - the privileged-view predicate falls back to uid == 0, so a su-granted app and the manager app are NOT covered here.\n",
+				ksu_allow_symbols[0], ksu_allow_symbols[1]);
+		else
+			SUSFS_LOGI("ksu_allow_gate: no KernelSU predicate here, and nothing to ask it: the control surface is root-only on this kernel\n");
 		return 0;
 	}
 

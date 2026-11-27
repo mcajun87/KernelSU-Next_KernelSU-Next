@@ -5,6 +5,17 @@
 #include <linux/cred.h>
 #include <linux/sched.h>
 #include <linux/types.h>
+#include <linux/version.h>
+
+/* Whether the KernelSU set can ever be let through susfs_control_visible(): only where
+ * susfs_relabel_control_nodes() can put the ksu_file label on the control nodes, which is below
+ * 6.4 (susfs_main.c returns early above it).  Used for what the module says at load, not for the
+ * gate itself - susfs_control_relabelled is still what the gate reads. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#define SUSFS_CONTROL_GATE_CAN_WIDEN 0
+#else
+#define SUSFS_CONTROL_GATE_CAN_WIDEN 1
+#endif
 
 /* "Is this process one KernelSU would allow?" - asked OF KernelSU, not re-derived here.
  *
@@ -28,8 +39,9 @@
  * 1 = KernelSU's __ksu_is_allow_uid_for_current.  This is the extension point: a second source -
  * another root solution's predicate, or an extra local rule - becomes case 2 in
  * susfs_ksu_allow_ask() without touching a single caller, because callers only ever see
- * susfs_ksu_allow_uid()/susfs_ksu_allow_current().  Set once by the init, read by everybody. */
-extern int susfs_ksu_allow_kind;
+ * susfs_ksu_allow_uid()/susfs_ksu_allow_current().  Set once by the init, read by everybody.
+ * The definition lives in ksu_allow_gate_data.c (D). */
+#include "ksu_allow_gate_data.h"
 
 /* The one indirect call, through the address resolved at load. */
 bool susfs_ksu_allow_ask(uid_t uid);

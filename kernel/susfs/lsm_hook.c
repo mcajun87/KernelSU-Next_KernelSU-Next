@@ -36,6 +36,7 @@
 #include <linux/version.h>		/* LINUX_VERSION_CODE for the gates below (do not rely on a transitive include) */
 
 #include "symbol_resolver.h"
+#include "btf_layout.h"
 #include "lsm_hook.h"
 #include "patch_memory.h"
 #include "susfs_log.h"
@@ -263,31 +264,45 @@ static int ksu_lsm_hook_head_at(unsigned long heads_addr, struct ksu_lsm_hook *h
         return 0;
     }
 
-    pr_warn("lsm_hook: %s: no list in security_hook_heads could be identified for it - falling back to the offsetof() slot, which is what this module always used and which does not check the list's identity\n",
+    {
+        size_t btf_off = 0, btf_size = 0;
+
+        if (hook->head_name &&
+            !susfs_btf_layout_init() &&
+            !susfs_btf_struct_size("security_hook_heads", &btf_size) &&
+            !susfs_btf_member_offset("security_hook_heads", hook->head_name,
+                                     "hlist_head", &btf_off) &&
+            btf_off + sizeof(struct hlist_head) <= btf_size) {
+            head = (struct hlist_head *)(heads_addr + btf_off);
+            first = hlist_entry_safe(READ_ONCE(head->first),
+                                     struct security_hook_list, list);
+            if (!first) {
+                pr_err("lsm_hook: %s: BTF head (%px, offset %#lx) is empty: refusing\n",
+                        hook->head_name, head, (unsigned long)btf_off);
+                return -ENOENT;
+            }
+            if (first->head != head) {
+                pr_err("lsm_hook: %s: BTF head %px reports first->head %px: refusing\n",
+                        hook->head_name, head, first->head);
+                return -EINVAL;
+            }
+            if (btf_off != hook->head_offset) {
+                pr_warn("lsm_hook: %s: resolved via vmlinux BTF at offset %#lx (build offsetof() was %#lx)\n",
+                        hook->head_name, (unsigned long)btf_off,
+                        (unsigned long)hook->head_offset);
+            } else {
+                SUSFS_LOGI("lsm_hook: %s: list head resolved via vmlinux BTF at offset %#lx\n",
+                        hook->head_name, (unsigned long)btf_off);
+            }
+            *out = head;
+            return 0;
+        }
+    }
+
+    // using compile time offset causes crash
+    pr_err("lsm_hook: %s: identity scan and vmlinux BTF lookup both failed: refusing offsetof() fallback\n",
             hook->head_name ?: "unknown");
-
-    if (hook->head_offset + sizeof(struct hlist_head) > sizeof(struct security_hook_heads)) {
-        pr_err("lsm_hook: %s: head offset %#lx is outside security_hook_heads\n",
-                hook->head_name ?: "unknown", (unsigned long)hook->head_offset);
-        return -EINVAL;
-    }
-
-    head = (struct hlist_head *)(heads_addr + hook->head_offset);
-    first = hlist_entry_safe(READ_ONCE(head->first), struct security_hook_list, list);
-
-    if (!first) {
-        pr_err("lsm_hook: %s: hook list is empty - refusing to insert (nothing to cross-check the head offset against)\n",
-                hook->head_name ?: "unknown");
-        return -ENOENT;
-    }
-    if (first->head != head) {
-        pr_err("lsm_hook: %s: entry at %px reports head %px, computed %px - struct security_hook_heads layout mismatch, refusing to patch\n",
-                hook->head_name ?: "unknown", first, first->head, head);
-        return -EINVAL;
-    }
-
-    *out = head;
-    return 0;
+    return -ENOENT;
 }
 
 /* Insert our node at the head of the list; lock held, head already validated. */
@@ -896,21 +911,22 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
 
     /* ---- replace path: find the entry whose function slot holds the resolved symbol. ---- */
     target_name = hook->target_name;
-    if (!target_name) {
-        pr_err("lsm_hook: hook %s: target_name is required\n", hook->head_name ?: "unknown");
-        ret = -EINVAL;
-        goto out_unlock;
-    }
-
     target = hook->original;
-    if (!target)
+    if (!target && target_name)
         target = ksu_resolve_symbol_for_functable_hook(target_name);
     if (!target) {
-        pr_err("lsm_hook: failed to resolve target for %s\n", hook->head_name ?: "unknown");
-        ret = -ENOENT;
-        goto out_unlock;
+        /* An LTO copy can have a different address than the kallsyms symbol (the
+         * registered selinux_setprocattr is one example).  The replace path knows
+         * the head, so fall back to its first entry: original becomes whatever
+         * function is installed there, and the wrapper still calls it for the
+         * pass-through.  Android runs SELinux as the only provider in these
+         * lists, so the first entry is the SELinux one.  target_name may also be
+         * NULL on purpose: the consumer wants the first entry, not a symbol. */
+        SUSFS_LOGI("lsm_hook: target %s not resolvable; falling back to the first entry of head %s\n",
+                target_name ?: "(none)", hook->head_name ?: "unknown");
+    } else {
+        SUSFS_LOGI("target: 0x%lx %pSb\n", (unsigned long)target, target);
     }
-    SUSFS_LOGI("target: 0x%lx %pSb\n", (unsigned long)target, target);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     if (!scalls_addr) {
@@ -1073,6 +1089,31 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     SUSFS_LOGI("heads_addr 0x%lx head_offset 0x%lx heads_size %ld hook_offset 0x%lx\n", (unsigned long)heads_addr,
             hook->head_offset, heads_size, hook->hook_offset);
 
+    if (!target) {
+        struct hlist_head *fallback_head =
+            (struct hlist_head *)(heads_addr + hook->head_offset);
+
+        if (!fallback_head->first) {
+            pr_err("lsm_hook: %s has no entries to replace\n",
+                    hook->head_name ?: "unknown");
+            ret = -ENOENT;
+            goto out_unlock;
+        }
+        entry = hlist_entry(fallback_head->first, struct security_hook_list, list);
+        selected_entry = entry;
+        selected_slot = (void **)((char *)entry + hook->hook_offset);
+        selected_origin = READ_ONCE(*selected_slot);
+        if (selected_origin == hook->replacement) {
+            ret = -EALREADY;
+            goto out_unlock;
+        }
+        SUSFS_LOGI("lsm_hook: fallback %s first entry orig %pSb\n",
+                hook->head_name ?: "unknown", selected_origin);
+        pr_warn("lsm_hook: WARNING: %s slot being taken by %s; displaced function %pSb (continuing install)\n",
+                hook->head_name ?: "unknown", "the first entry", selected_origin);
+        goto fallback_found;
+    }
+
     for (; head < head_end; head++) {
         hlist_for_each_entry (entry, head, list) {
             void **slot = (void **)((char *)entry + hook->hook_offset);
@@ -1132,6 +1173,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
         }
     }
 
+fallback_found:
     if (!selected_entry) {
         pr_err("lsm_hook: target %s not found in head %s\n", target_name, hook->head_name ?: "unknown");
         ret = -ENOENT;
@@ -1280,6 +1322,16 @@ static void ksu_lsm_hook_drain(void)
         msleep(50);
 }
 
+/* The same wait, for the other features that publish a pointer readers reach with no RCU
+ * read-side section of their own: spoof_cmdline's saved_boot_config (read by seq_puts() in
+ * boot_config_proc_show()) and open_redirect's rule slots (read by kprobe handlers).  It
+ * lives here because this file already resolves synchronize_rcu_tasks() and owns the __nocfi
+ * wrapper the indirect call needs.  Sleeps; process context only. */
+void susfs_wait_for_readers(void)
+{
+    ksu_lsm_hook_drain();
+}
+
 int ksu_register_lsm_hook(struct ksu_lsm_hook *hook)
 {
     return ksu_lsm_hook(hook);
@@ -1288,6 +1340,19 @@ int ksu_register_lsm_hook(struct ksu_lsm_hook *hook)
 void ksu_unregister_lsm_hook(struct ksu_lsm_hook *hook)
 {
     ksu_lsm_unhook(hook);
+}
+
+/* Whether the table the hook insertion actually walks can be resolved at all: the < 6.12
+ * path inserts into security_hook_heads, the >= 6.12 path into static_calls_table.  The init
+ * below only reports; refusing the load is the layer table's call, because only the caller
+ * can turn a missing symbol into a failed module load. */
+bool ksu_lsm_hook_ready(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    return find_kernel_symbol_exact("static_calls_table") != 0;
+#else
+    return find_kernel_symbol_exact("security_hook_heads") != 0;
+#endif
 }
 
 /* No __init/__exit annotation on these two on purpose: the layer table (susfs_main.c) holds their
