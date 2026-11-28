@@ -50,6 +50,10 @@
 #include <linux/string.h>
 #include <linux/cred.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the inode ctime accessor */
+#include <linux/statfs.h>	/* struct kstatfs / vfs_statfs: the statfs face */
+#include <linux/hash.h>		/* hash_64: the lookup bucket */
+#include <linux/log2.h>		/* ilog2: bucket count bits */
+#include <linux/list.h>		/* struct hlist_node / hlist_head */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "sus_path.h"
@@ -73,7 +77,10 @@
 #define KSTAT_AUTO_SPOOF_FULL_CLONE (KSTAT_AUTO_SPOOF | \
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
-#define SUS_KSTAT_MAX 32
+#define SUS_KSTAT_MAX 256
+/* Lookup buckets: hash_64(target_ino) & (N-1); 64 buckets keeps the per-bucket
+ * chain at ~4 entries with the 256-entry cap. */
+#define KSTAT_HASH_BUCKETS 64
 /* Upstream's target_pathname is char[256]: a shorter buffer truncates a legal long path into a wrong rule. */
 #define KSTAT_PATH_MAX 256
 
@@ -95,9 +102,16 @@ struct sus_kstat_entry {
 	long long spoofed_blocks;
 	long spoofed_blksize;
 	unsigned int flags;
+	/* statfs() answer for this target, snapshotted at add time (upstream
+	 * susfs_sus_kstat_spoof_vfs_statfs copies the same struct back). */
+	struct kstatfs spoofed_kstatfs;
+	/* Hash chain for (target_ino, target_dev) lookups; guarded by
+	 * kstat_table_lock like the rest of the table. */
+	struct hlist_node node;
 };
 
 static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
+static struct hlist_head kstat_hash[KSTAT_HASH_BUCKETS];
 static int nkstat;
 static DEFINE_MUTEX(kstat_lock);
 
@@ -216,19 +230,40 @@ static bool susfs_kstat_table_empty(void)
 	return READ_ONCE(nkstat) == 0;
 }
 
+/* ---- hash map over (target_ino, target_dev) ----
+ * kstat_entries stays the slot storage (indices are stable for kstat_lock
+ * holders); kstat_hash[] is the lookup index every read path walks instead of
+ * the whole array.  All of it is under kstat_table_lock, the same lock the
+ * linear walk took.  hlist_del_init() tolerates an unhashed node, so the
+ * helpers below are safe on freshly built entries. */
+static u32 kstat_bucket(unsigned long ino)
+{
+	return hash_64((u64)ino, ilog2(KSTAT_HASH_BUCKETS));
+}
+
+static void kstat_hash_add(struct sus_kstat_entry *e)
+{
+	hlist_del_init(&e->node);
+	hlist_add_head(&e->node, &kstat_hash[kstat_bucket(e->target_ino)]);
+}
+
+static void kstat_hash_del(struct sus_kstat_entry *e)
+{
+	hlist_del_init(&e->node);
+}
+
 /* Hot-path lookup: match (ino, dev) and copy the entry out atomically w.r.t. the writers. */
 static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
 			       struct sus_kstat_snapshot *out)
 {
 	unsigned long flags;
+	struct sus_kstat_entry *e;
 	bool found = false;
-	int i;
 
 	spin_lock_irqsave(&kstat_table_lock, flags);
-	for (i = 0; i < nkstat; i++) {
-		if (kstat_entries[i].target_ino == ino &&
-		    kstat_entries[i].target_dev == dev) {
-			kstat_snapshot(&kstat_entries[i], out);
+	hlist_for_each_entry(e, &kstat_hash[kstat_bucket(ino)], node) {
+		if (e->target_ino == ino && e->target_dev == dev) {
+			kstat_snapshot(e, out);
 			found = true;
 			break;
 		}
@@ -271,6 +306,7 @@ static int kstat_table_append(const struct sus_kstat_entry *src)
 	if (nkstat < SUS_KSTAT_MAX) {
 		idx = nkstat;
 		kstat_entries[idx] = *src;
+		kstat_hash_add(&kstat_entries[idx]);
 		nkstat = idx + 1;
 	}
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
@@ -283,8 +319,11 @@ static void kstat_table_put(int idx, const struct sus_kstat_entry *src)
 	unsigned long flags;
 
 	spin_lock_irqsave(&kstat_table_lock, flags);
-	if (idx >= 0 && idx < nkstat)
+	if (idx >= 0 && idx < nkstat) {
+		kstat_hash_del(&kstat_entries[idx]);
 		kstat_entries[idx] = *src;
+		kstat_hash_add(&kstat_entries[idx]);
+	}
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
 
@@ -296,9 +335,11 @@ static void kstat_table_retarget(int idx, unsigned long ino, dev_t dev,
 
 	spin_lock_irqsave(&kstat_table_lock, flags);
 	if (idx >= 0 && idx < nkstat) {
+		kstat_hash_del(&kstat_entries[idx]);
 		kstat_entries[idx].target_ino = ino;
 		kstat_entries[idx].target_dev = dev;
 		kstat_entries[idx].flags |= add_flags;
+		kstat_hash_add(&kstat_entries[idx]);
 	}
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
@@ -311,8 +352,14 @@ static void kstat_table_del(int idx)
 	spin_lock_irqsave(&kstat_table_lock, flags);
 	if (idx >= 0 && idx < nkstat) {
 		nkstat--;
-		if (idx != nkstat)
+		kstat_hash_del(&kstat_entries[idx]);
+		if (idx != nkstat) {
+			/* Move the last entry into the hole.  The hash node moves
+			 * with it, so both chains are updated in place. */
+			kstat_hash_del(&kstat_entries[nkstat]);
 			kstat_entries[idx] = kstat_entries[nkstat];
+			kstat_hash_add(&kstat_entries[idx]);
+		}
 	}
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
@@ -323,6 +370,10 @@ static void kstat_table_clear(void)
 
 	spin_lock_irqsave(&kstat_table_lock, flags);
 	nkstat = 0;
+	/* The hash nodes live in the entries; zeroing both keeps a later append
+	 * from unlinking a stale node. */
+	memset(kstat_entries, 0, sizeof(kstat_entries));
+	memset(kstat_hash, 0, sizeof(kstat_hash));
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
 
@@ -1908,6 +1959,13 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	e->spoofed_blocks = inode->i_blocks;
 	e->spoofed_blksize = 1 << inode->i_blkbits;
 
+	/* statfs snapshot: the vfs_statfs() answer of the target path, so a
+	 * statfs()/fstatfs() lookup of the hidden inode can return the same
+	 * numbers the visible target would (upstream susfs.c stores the same
+	 * struct in st_susfs_sus_kstat_hlist).  A failure leaves the zero
+	 * snapshot, which the statfs face treats as "nothing to spoof". */
+	vfs_statfs(&p, &e->spoofed_kstatfs);
+
 	path_put(&p);
 	return 0;
 }
@@ -2159,6 +2217,74 @@ static int kstat_hooks_armed;
 /* One centre registration per table entry; the table itself stays here. */
 static struct susfs_hook kstat_reg[ARRAY_SIZE(kstat_hooks)];
 
+/* ---- statfs face: vfs_statfs(path, buf) ----
+ * Same shape as susfs_open_redirect.c's reverse statfs: the entry probe copies the registered
+ * snapshot out of the table (under kstat_table_lock, like every other read path) and remembers
+ * the caller's buffer; the return probe writes it over the kernel's answer when statfs
+ * succeeded.  A rule without a snapshot (vfs_statfs failed at add time) keeps the kernel answer. */
+struct kstat_statfs_args {
+	struct kstatfs *buf;
+	struct kstatfs snapshot;
+	bool hit;
+};
+
+static int kstat_statfs_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const struct path *path = (const struct path *)regs->regs[0];
+	struct kstat_statfs_args *a = (struct kstat_statfs_args *)ri->data;
+	struct sus_kstat_entry *e;
+	struct inode *inode;
+	unsigned long ino;
+	dev_t dev;
+	unsigned long flags;
+
+	a->hit = false;
+	a->buf = NULL;
+	if (!READ_ONCE(nkstat) || IS_ERR_OR_NULL(path) || !path->dentry)
+		return 0;
+	inode = d_backing_inode(path->dentry);
+	if (!inode || !susfs_kstat_gate_ok())
+		return 0;
+	ino = inode->i_ino;
+	dev = new_encode_dev(inode->i_sb->s_dev);
+
+	a->buf = (struct kstatfs *)regs->regs[1];
+	if (!a->buf)
+		return 0;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	hlist_for_each_entry(e, &kstat_hash[kstat_bucket(ino)], node) {
+		if (e->target_ino == ino && e->target_dev == dev &&
+		    e->spoofed_kstatfs.f_type) {
+			a->snapshot = e->spoofed_kstatfs;
+			a->hit = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+	return 0;
+}
+
+static int kstat_statfs_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const struct kstat_statfs_args *a = (const struct kstat_statfs_args *)ri->data;
+
+	if (!a->hit || !a->buf || (long)regs->regs[0] != 0)
+		return 0;
+	*a->buf = a->snapshot;
+	return 0;
+}
+
+static struct kretprobe kr_kstat_statfs = {
+	.kp.symbol_name = "vfs_statfs",
+	.entry_handler = kstat_statfs_entry,
+	.handler = kstat_statfs_ret,
+	.data_size = sizeof(struct kstat_statfs_args),
+	.maxactive = 64,
+};
+
+static bool kstat_statfs_registered;
+
 int susfs_kstat_init(void)
 {
 	int rc;
@@ -2217,6 +2343,15 @@ int susfs_kstat_init(void)
 	SUSFS_LOGI("kstat armed: %d rules (%d/%u table entries installed, proc=%d); stat rewrite + sus_path dirent rewrite ride those entries\n",
 		nkstat, kstat_hooks_armed, (unsigned int)ARRAY_SIZE(kstat_hooks),
 		kstat_proc_entry != NULL);
+
+	/* statfs face: not fatal when it cannot arm (the stat rewrite above is
+	 * the feature; statfs() then answers with the kernel's own numbers). */
+	if (!register_kretprobe(&kr_kstat_statfs)) {
+		kstat_statfs_registered = true;
+		SUSFS_LOGI("kstat statfs: vfs_statfs kretprobe armed\n");
+	} else {
+		pr_warn("kstat statfs: register_kretprobe(vfs_statfs) failed - statfs spoofing stays off\n");
+	}
 	return 0;
 }
 
@@ -2243,6 +2378,10 @@ void susfs_kstat_exit(void)
 	if (kstat_proc_entry) {
 		proc_remove(kstat_proc_entry);
 		kstat_proc_entry = NULL;
+	}
+	if (kstat_statfs_registered) {
+		unregister_kretprobe(&kr_kstat_statfs);
+		kstat_statfs_registered = false;
 	}
 	kstat_table_clear();
 }
